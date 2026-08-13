@@ -1,0 +1,6 @@
+interface:
+  display_name: "Configure Sol-Luna Subagents"
+  short_description: "Configure a safe global Sol-to-Luna Codex baseline"
+  default_prompt: "Use $configure-sol-luna-subagents to configure the global Sol and Luna baseline."
+policy:
+  allow_implicit_invocation: false
