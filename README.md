@@ -2,6 +2,14 @@
 
 # Configure Sol → Luna Subagents
 
+Worried about running out of Codex credits? Make every Sol call count: let Sol
+handle planning, review, and final decisions, while Luna takes on well-bounded
+execution tasks. The escalation path back to Sol remains available, and this
+design is intended to reduce unnecessary top-tier-model calls.
+
+*Actual credit usage depends on the task, call count, account plan, and pricing;
+this project promises no fixed savings.*
+
 This repository provides a cross-platform Codex skill for a small global
 subagent baseline: the main thread uses Sol, and two narrowly scoped agents use
 Luna. It changes only the global Codex home. It does not scan or edit project
@@ -51,6 +59,18 @@ another ambiguity that could make a safe merge impossible.
 After a successful install, start a new Codex session or restart the client so
 the global configuration is loaded. Existing sessions do not retroactively
 change their already-loaded agent configuration.
+
+## FAQ: What does installation enable?
+
+Installing the skill only makes the configurator available; it does not apply
+the global configuration. Use the one-message install-and-run entry above, or
+invoke `$configure-sol-luna-subagents` after installation, then start a new
+Codex session or restart the client. Once the configuration is loaded, Codex
+may automatically delegate eligible nontrivial mapping and well-bounded
+implementation work to Luna without an explicit per-task delegation prompt.
+Trivial work stays in Sol, and not every task is forced to use a subagent.
+Project `AGENTS.md`/instructions and client capabilities may refine or override
+this routing.
 
 ## Resulting baseline
 
