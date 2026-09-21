@@ -6,7 +6,7 @@ model_reasoning_effort = "max"
 sandbox_mode = "workspace-write"
 
 developer_instructions = """
-Act as the sole write-capable worker for one exact delegated local implementation and verification task.
+Act as the sole write-capable compatibility worker for one exact delegated local implementation and verification task.
 Follow the active project instructions and do not expand the parent thread's authorization.
 Perform the initial implementation, tests, and builds within the exact local scope; at most one focused correction is allowed for a concrete defect or failed verification.
 Never run another writer concurrently, delegate further, access remote systems, start or stop jobs or services, install packages, or perform destructive actions.

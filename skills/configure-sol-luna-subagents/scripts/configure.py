@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Safely configure a global two-model Sol/Luna Codex baseline.
+"""Safely install and synchronize a portable Astra/Luna Codex baseline.
 
-The script deliberately edits only files below CODEX_HOME.  It uses a
-conservative line-aware merge for config.toml so comments and unrelated
-settings remain untouched.
+The configurator edits only the selected ``CODEX_HOME``. It uses a small
+line-aware TOML merge for native config and marked registry blocks so comments,
+unrelated roles, providers, hooks, MCP servers, and project registrations are
+preserved. It never starts a model task.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 try:
@@ -36,22 +37,19 @@ ASSETS_DIR = SKILL_DIR / "assets"
 CONFIG_NAME = "config.toml"
 AGENTS_NAME = "AGENTS.md"
 OVERRIDE_NAME = "AGENTS.override.md"
-AGENT_ASSETS = {
-    "sol_luna_code_mapper.toml": "sol_luna_code_mapper.toml",
-    "sol_luna_implementation_worker.toml": "sol_luna_implementation_worker.toml",
-}
+MODEL_TIERS_NAME = "model-tiers.toml"
+ROLE_BINDINGS_NAME = "agent-tiers.toml"
 AGENT_MARKER_PREFIX = "configure-sol-luna-subagents:"
 AGENTS_BEGIN = "<!-- BEGIN MANAGED: configure-sol-luna-subagents -->"
 AGENTS_END = "<!-- END MANAGED: configure-sol-luna-subagents -->"
+MODEL_BEGIN = "# BEGIN MANAGED: configure-sol-luna-subagents:model-tiers"
+MODEL_END = "# END MANAGED: configure-sol-luna-subagents:model-tiers"
+ROLES_BEGIN = "# BEGIN MANAGED: configure-sol-luna-subagents:agent-tiers"
+ROLES_END = "# END MANAGED: configure-sol-luna-subagents:agent-tiers"
+PROFILE_RE = re.compile(r"^# profile: ([a-z0-9-]+)\s*$", re.MULTILINE)
 
-ROOT_VALUES: tuple[tuple[str, Any], ...] = (
-    ("model", "gpt-5.6-sol"),
-    ("model_reasoning_effort", "max"),
-)
-AGENTS_VALUES: tuple[tuple[str, Any], ...] = (
+BASE_AGENTS_VALUES: tuple[tuple[str, Any], ...] = (
     ("enabled", True),
-    ("default_subagent_model", "gpt-5.6-luna"),
-    ("default_subagent_reasoning_effort", "max"),
     ("max_depth", 1),
     ("max_concurrent_threads_per_session", 3),
 )
@@ -62,20 +60,131 @@ class ConfigureError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class Profile:
+    key: str
+    display_name: str
+    main_model: str
+    main_effort: str
+    default_model: str
+    default_effort: str
+    tier_models: Mapping[str, tuple[str, str, tuple[str, ...]]]
+    role_bindings: Mapping[str, tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class RoleSpec:
+    path_name: str
+    asset_name: str
+    expected_name: str
+    binding_name: str
+    sandbox_mode: str
+
+
+@dataclass(frozen=True)
+class AgentTarget:
+    path: Path
+    before: str
+    after: str
+    expected_name: str
+    model: str
+    effort: str
+    provider: str
+    sandbox_mode: str
+
+
+@dataclass(frozen=True)
+class RegistryState:
+    profile: str
+    tiers: Mapping[str, Mapping[str, Any]]
+    roles: Mapping[str, Mapping[str, Any]]
+
+
+@dataclass(frozen=True)
 class Plan:
     home: Path
+    profile: Profile
     config_path: Path
     instruction_path: Path
-    agent_paths: tuple[Path, ...]
+    model_tiers_path: Path
+    role_bindings_path: Path
     config_before: str
     config_after: str
     instruction_before: str
     instruction_after: str
-    agent_before_after: tuple[tuple[Path, str, str], ...]
+    model_tiers_before: str
+    model_tiers_after: str
+    role_bindings_before: str
+    role_bindings_after: str
+    agent_targets: tuple[AgentTarget, ...]
 
     @property
     def targets(self) -> tuple[Path, ...]:
-        return (self.config_path, self.instruction_path) + self.agent_paths
+        return (
+            self.config_path,
+            self.instruction_path,
+            self.model_tiers_path,
+            self.role_bindings_path,
+        ) + tuple(target.path for target in self.agent_targets)
+
+
+PROFILES: dict[str, Profile] = {
+    "astra-luna": Profile(
+        key="astra-luna",
+        display_name="Astra → Luna",
+        main_model="gpt-6-astra",
+        main_effort="medium",
+        default_model="gpt-5.6-luna",
+        default_effort="max",
+        tier_models={
+            "T1": ("openai", "gpt-6-astra", ("low", "medium", "high", "max")),
+            "T2": ("openai", "gpt-5.6-luna", ("low", "medium", "high", "xhigh", "max")),
+            "T3": ("openai", "gpt-5.6-luna", ("low", "medium", "high", "xhigh", "max")),
+        },
+        role_bindings={
+            "main": ("T1", "medium"),
+            "default_subagent": ("T2", "max"),
+            "agents.default": ("T2", "max"),
+            "code_mapper": ("T2", "max"),
+            "implementation_worker": ("T2", "max"),
+            "routine_state_checker": ("T3", "max"),
+            # Retained so an existing installation can keep its old filenames.
+            "sol_luna_code_mapper": ("T2", "max"),
+            "sol_luna_implementation_worker": ("T2", "max"),
+        },
+    ),
+    "sol-luna": Profile(
+        key="sol-luna",
+        display_name="legacy Sol → Luna",
+        main_model="gpt-5.6-sol",
+        main_effort="max",
+        default_model="gpt-5.6-luna",
+        default_effort="max",
+        tier_models={
+            "T1": ("openai", "gpt-5.6-sol", ("low", "medium", "high", "max")),
+            "T2": ("openai", "gpt-5.6-luna", ("low", "medium", "high", "xhigh", "max")),
+            "T3": ("openai", "gpt-5.6-luna", ("low", "medium", "high", "xhigh", "max")),
+        },
+        role_bindings={
+            "main": ("T1", "max"),
+            "default_subagent": ("T2", "max"),
+            "agents.default": ("T2", "max"),
+            "code_mapper": ("T2", "max"),
+            "implementation_worker": ("T2", "max"),
+            "routine_state_checker": ("T3", "max"),
+            "sol_luna_code_mapper": ("T2", "max"),
+            "sol_luna_implementation_worker": ("T2", "max"),
+        },
+    ),
+}
+PROFILE_ALIASES = {
+    "astra": "astra-luna",
+    "astra-luna": "astra-luna",
+    "default": "astra-luna",
+    "legacy-sol": "sol-luna",
+    "legacy-sol-luna": "sol-luna",
+    "sol": "sol-luna",
+    "sol-luna": "sol-luna",
+}
 
 
 def _require_tomllib() -> Any:
@@ -105,8 +214,7 @@ def _assert_safe_parent(path: Path, root: Path) -> None:
     if parent.is_symlink():
         raise ConfigureError(f"refusing symlink parent: {parent}")
     try:
-        resolved_parent = parent.resolve()
-        resolved_parent.relative_to(resolved_root)
+        parent.resolve().relative_to(resolved_root)
     except (OSError, ValueError) as exc:
         raise ConfigureError(f"target escapes its allowed root: {path}") from exc
 
@@ -212,15 +320,15 @@ def _render_value(value: Any) -> str:
         return str(value)
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_render_value(item) for item in value) + "]"
     raise ConfigureError(f"unsupported native value type: {type(value).__name__}")
 
 
 def _replace_assignment(line: str, key: str, value: Any) -> str:
     content, ending = _split_line_ending(line)
     code, comment = _split_comment(content)
-    match = re.match(
-        rf"^(?P<prefix>\s*{re.escape(key)}\s*=\s*)(?P<rhs>.*)$", code
-    )
+    match = re.match(rf"^(?P<prefix>\s*{re.escape(key)}\s*=\s*)(?P<rhs>.*)$", code)
     if match is None:
         raise ConfigureError(f"cannot safely update config.toml key {key!r}")
     try:
@@ -259,35 +367,32 @@ def _append_section(text: str, fields: Iterable[tuple[str, Any]], newline: str) 
     return result
 
 
-def _parse_toml(
-    text: str, label: str, *, allow_multiline_strings: bool = False
-) -> dict[str, Any]:
+def _parse_toml(text: str, label: str, *, allow_multiline_strings: bool = False) -> dict[str, Any]:
     parser = _require_tomllib()
-    if not allow_multiline_strings and ("\"\"\"" in text or "'''" in text):
+    if not allow_multiline_strings and ('"""' in text or "'''" in text):
         raise ConfigureError(
             f"{label} contains a multiline TOML string; safe line-preserving merge is ambiguous"
         )
     try:
         value = parser.loads(text)
-    except Exception as exc:  # TOMLDecodeError differs slightly across Python versions.
+    except Exception as exc:  # TOMLDecodeError differs across Python versions.
         raise ConfigureError(f"invalid TOML: {label}") from exc
     if not isinstance(value, dict):
         raise ConfigureError(f"TOML root is not a table: {label}")
     return value
 
 
-def _config_after(text: str) -> str:
+def _config_after(
+    text: str,
+    root_values: tuple[tuple[str, Any], ...],
+    agents_values: tuple[tuple[str, Any], ...],
+) -> str:
+    all_agent_values = (*BASE_AGENTS_VALUES, *agents_values)
     if not text:
-        newline = "\n"
         return (
-            "model = \"gpt-5.6-sol\"\n"
-            "model_reasoning_effort = \"max\"\n\n"
-            "[agents]\n"
-            "enabled = true\n"
-            "default_subagent_model = \"gpt-5.6-luna\"\n"
-            "default_subagent_reasoning_effort = \"max\"\n"
-            "max_depth = 1\n"
-            "max_concurrent_threads_per_session = 3\n"
+            "".join(f"{key} = {_render_value(value)}\n" for key, value in root_values)
+            + "\n[agents]\n"
+            + "".join(f"{key} = {_render_value(value)}\n" for key, value in all_agent_values)
         )
 
     parsed = _parse_toml(text, CONFIG_NAME)
@@ -297,7 +402,7 @@ def _config_after(text: str) -> str:
     root_assignments = _assignments(lines, 0, first_header)
     replacements: dict[int, str] = {}
     missing_root: list[tuple[str, Any]] = []
-    for key, value in ROOT_VALUES:
+    for key, value in root_values:
         if key in parsed:
             if key not in root_assignments:
                 raise ConfigureError(f"root key {key!r} uses an unsupported complex layout")
@@ -308,44 +413,47 @@ def _config_after(text: str) -> str:
             missing_root.append((key, value))
 
     agents_value = parsed.get("agents")
-    agent_section = [
+    agent_sections = [
         section for section in sections if section[2] == "table" and section[3] == "agents"
     ]
-    if len(agent_section) > 1:
+    if len(agent_sections) > 1:
         raise ConfigureError("ambiguous duplicate [agents] sections")
-    if agent_section:
-        agent_start, agent_end, _, _ = agent_section[0]
+    if agent_sections:
+        agent_start, agent_end, _, _ = agent_sections[0]
         agent_assignments = _assignments(lines, agent_start + 1, agent_end)
+        if not isinstance(agents_value, dict):
+            raise ConfigureError("agents is not a simple [agents] table; refusing to guess")
         replacements_agents: dict[int, str] = {}
         missing_agents: list[tuple[str, Any]] = []
-        for key, value in AGENTS_VALUES:
-            present = isinstance(agents_value, dict) and key in agents_value
-            if present:
+        for key, value in all_agent_values:
+            if key in agents_value:
                 if key not in agent_assignments:
-                    raise ConfigureError(f"[agents] key {key!r} uses an unsupported complex layout")
+                    raise ConfigureError(
+                        f"[agents] key {key!r} uses an unsupported complex layout"
+                    )
                 replacements_agents[agent_assignments[key]] = _replace_assignment(
                     lines[agent_assignments[key]], key, value
                 )
             else:
                 missing_agents.append((key, value))
-        if isinstance(agents_value, dict) and "max_threads" in agents_value:
+        remove_index = None
+        if "max_threads" in agents_value:
             if "max_threads" not in agent_assignments:
                 raise ConfigureError("[agents].max_threads uses an unsupported complex layout")
             remove_index = agent_assignments["max_threads"]
-            _replace_assignment(lines[remove_index], "max_threads", 0)
-        else:
-            remove_index = None
         replacements_all = {**replacements, **replacements_agents}
-        new_lines: list[str] = []
-        for index, line in enumerate(lines):
-            if index == remove_index:
-                continue
-            new_lines.append(replacements_all.get(index, line))
+        new_lines = [
+            replacements_all.get(index, line)
+            for index, line in enumerate(lines)
+            if index != remove_index
+        ]
         if missing_root:
             first_header_after, _ = _section_ranges(new_lines)
-            new_lines[first_header_after:first_header_after] = _line_block(missing_root, newline)
+            new_lines[first_header_after:first_header_after] = _line_block(
+                missing_root, newline
+            )
         if missing_agents:
-            first_after, sections_after = _section_ranges(new_lines)
+            _, sections_after = _section_ranges(new_lines)
             exact = [
                 section
                 for section in sections_after
@@ -353,8 +461,7 @@ def _config_after(text: str) -> str:
             ]
             if len(exact) != 1:
                 raise ConfigureError("cannot locate the updated [agents] section")
-            insert_at = exact[0][1]
-            new_lines[insert_at:insert_at] = _line_block(missing_agents, newline)
+            new_lines[exact[0][1]:exact[0][1]] = _line_block(missing_agents, newline)
         return "".join(new_lines)
 
     if agents_value is not None:
@@ -363,7 +470,7 @@ def _config_after(text: str) -> str:
     if missing_root:
         first_header_after, _ = _section_ranges(new_lines)
         new_lines[first_header_after:first_header_after] = _line_block(missing_root, newline)
-    return _append_section("".join(new_lines), AGENTS_VALUES, newline)
+    return _append_section("".join(new_lines), all_agent_values, newline)
 
 
 def _replace_marked_block(text: str, begin: str, end: str, replacement: str) -> str:
@@ -373,34 +480,33 @@ def _replace_marked_block(text: str, begin: str, end: str, replacement: str) -> 
     end_count = text.count(end)
     if begin_count == 0 and end_count == 0:
         if text and not text.endswith(("\n", "\r")):
-            text += "\n"
+            text += newline
         return text + replacement
     if begin_count != 1 or end_count != 1:
-        raise ConfigureError("managed instruction block has duplicate or incomplete markers")
+        raise ConfigureError("managed block has duplicate or incomplete markers")
     begin_at = text.find(begin)
     end_at = text.find(end)
     if end_at <= begin_at:
-        raise ConfigureError("managed instruction block markers are out of order")
+        raise ConfigureError("managed block markers are out of order")
     start = text.rfind("\n", 0, begin_at) + 1
     end_line = text.find("\n", end_at)
-    end = len(text) if end_line == -1 else end_line + 1
-    return text[:start] + replacement + text[end:]
+    end_position = len(text) if end_line == -1 else end_line + 1
+    return text[:start] + replacement + text[end_position:]
 
 
 def _agent_marker(role: str, side: str) -> str:
     return f"# {side} MANAGED: {AGENT_MARKER_PREFIX}{role}"
 
 
-def _agent_after(path: Path, asset_text: str, role: str) -> tuple[bool, str, str]:
+def _agent_after(path: Path, asset_text: str, role: str) -> tuple[str, str]:
     existed, before = _read_optional_text(path)
     begin = _agent_marker(role, "BEGIN")
     end = _agent_marker(role, "END")
     if not existed:
-        return False, before, asset_text
+        return before, asset_text
     if begin not in before and end not in before:
         raise ConfigureError(f"unmanaged agent collision: {path.name}")
-    after = _replace_marked_block(before, begin, end, asset_text)
-    return True, before, after
+    return before, _replace_marked_block(before, begin, end, asset_text)
 
 
 def _active_instruction_path(home: Path) -> Path:
@@ -416,107 +522,398 @@ def _active_instruction_path(home: Path) -> Path:
 
 
 def _assets() -> tuple[str, dict[str, str]]:
-    agents: dict[str, str] = {}
-    for filename, asset_name in AGENT_ASSETS.items():
-        path = ASSETS_DIR / asset_name
-        if not path.is_file():
-            raise ConfigureError(f"missing bundled agent asset: {asset_name}")
-        agents[filename] = _read_text(path)
-    agents_block_path = ASSETS_DIR / "AGENTS.block.md"
-    if not agents_block_path.is_file():
+    block_path = ASSETS_DIR / "AGENTS.block.md"
+    if not block_path.is_file():
         raise ConfigureError("missing bundled AGENTS block asset")
-    block = _read_text(agents_block_path)
+    block = _read_text(block_path)
     if AGENTS_BEGIN not in block or AGENTS_END not in block:
         raise ConfigureError("bundled AGENTS block markers are incomplete")
-    return block, agents
+    names = (
+        "code_mapper.toml",
+        "implementation_worker.toml",
+        "routine_state_checker.toml",
+        "sol_luna_code_mapper.toml",
+        "sol_luna_implementation_worker.toml",
+    )
+    assets: dict[str, str] = {}
+    for name in names:
+        path = ASSETS_DIR / name
+        if not path.is_file():
+            raise ConfigureError(f"missing bundled agent asset: {name}")
+        assets[name] = _read_text(path)
+    return block, assets
 
 
-def _build_plan(home: Path) -> Plan:
-    block, agents = _assets()
+def _profile(value: str | None, *, home: Path | None = None, auto: bool = False) -> Profile:
+    if auto and value is None and home is not None:
+        model_path = home / MODEL_TIERS_NAME
+        if model_path.is_file():
+            match = PROFILE_RE.search(_read_text(model_path))
+            if match and match.group(1) in PROFILES:
+                return PROFILES[match.group(1)]
+    key = PROFILE_ALIASES.get(value or "astra-luna")
+    if key is None:
+        raise ConfigureError(f"unknown profile {value!r}; choose astra-luna or sol-luna")
+    return PROFILES[key]
+
+
+def _registry_block(profile: Profile, *, roles: bool) -> str:
+    begin, end = (ROLES_BEGIN, ROLES_END) if roles else (MODEL_BEGIN, MODEL_END)
+    lines = [begin, f"# profile: {profile.key}"]
+    if not roles:
+        lines.append("# Tiers select provider/model only; role permissions stay in agent TOML files.")
+        for tier, (provider, model, efforts) in profile.tier_models.items():
+            lines.extend(
+                [
+                    "",
+                    f"[tiers.{tier}]",
+                    "enabled = true",
+                    f"model_provider = {_render_value(provider)}",
+                    f"model = {_render_value(model)}",
+                    f"supported_efforts = {_render_value(efforts)}",
+                ]
+            )
+    else:
+        lines.append("# Tier bindings select model/effort; sandbox and authority stay in agent TOML files.")
+        for role, (tier, effort) in profile.role_bindings.items():
+            table = f'[roles."{role}"]' if "." in role else f"[roles.{role}]"
+            lines.extend(["", table, f"tier = {_render_value(tier)}", f"effort = {_render_value(effort)}"])
+    lines.append(end)
+    return "\n".join(lines) + "\n"
+
+
+def _registry_after(
+    path: Path,
+    desired: str,
+    begin: str,
+    end: str,
+    target_names: Iterable[str],
+    label: str,
+) -> tuple[str, str]:
+    existed, before = _read_optional_text(path)
+    if not existed:
+        return before, desired
+    _parse_toml(before, label, allow_multiline_strings=True)
+    begin_count, end_count = before.count(begin), before.count(end)
+    if begin_count == 0 and end_count == 0:
+        parsed = _parse_toml(before, label, allow_multiline_strings=True)
+        container_name = "roles" if begin == ROLES_BEGIN else "tiers"
+        container = parsed.get(container_name)
+        if isinstance(container, dict) and (
+            any(_role_table(container, name) is not None for name in target_names)
+            if begin == ROLES_BEGIN
+            else any(name in container for name in target_names)
+        ):
+            raise ConfigureError(f"unmanaged registry collision in {path.name}")
+        suffix = "" if not before or before.endswith(("\n", "\r")) else "\n"
+        return before, before + suffix + "\n" + desired
+    if begin_count != 1 or end_count != 1:
+        raise ConfigureError(f"managed registry block is incomplete in {path.name}")
+    marker_block = before[before.find(begin): before.find(end) + len(end)]
+    match = PROFILE_RE.search(marker_block)
+    desired_match = PROFILE_RE.search(desired)
+    if match is None or desired_match is None:
+        raise ConfigureError(f"managed registry profile is missing in {path.name}")
+    if match.group(1) == desired_match.group(1):
+        # Existing managed values are the editable source of truth.
+        return before, before
+    return before, _replace_marked_block(before, begin, end, desired)
+
+
+def _role_table(roles: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:
+    direct = roles.get(name)
+    if isinstance(direct, dict):
+        return direct
+    current: Any = roles
+    for part in name.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current if isinstance(current, dict) else None
+
+
+def _registry_state(model_text: str, role_text: str, profile: Profile) -> RegistryState:
+    model = _parse_toml(model_text, MODEL_TIERS_NAME, allow_multiline_strings=True)
+    roles_doc = _parse_toml(role_text, ROLE_BINDINGS_NAME, allow_multiline_strings=True)
+    model_match = PROFILE_RE.search(model_text)
+    role_match = PROFILE_RE.search(role_text)
+    if not model_match or not role_match or model_match.group(1) != role_match.group(1):
+        raise ConfigureError("model-tiers.toml and agent-tiers.toml have no matching managed profile")
+    if model_match.group(1) != profile.key:
+        raise ConfigureError(
+            f"registry profile is {model_match.group(1)!r}, but requested profile is {profile.key!r}"
+        )
+    tiers = model.get("tiers")
+    roles = roles_doc.get("roles")
+    if not isinstance(tiers, dict) or not isinstance(roles, dict):
+        raise ConfigureError("tier registries must contain [tiers.*] and [roles.*] tables")
+    referenced_tiers = set(profile.tier_models)
+    for name in profile.role_bindings:
+        binding = _role_table(roles, name)
+        if isinstance(binding, dict) and isinstance(binding.get("tier"), str):
+            referenced_tiers.add(binding["tier"])
+
+    def collect_referenced(value: Any) -> None:
+        if isinstance(value, dict):
+            if isinstance(value.get("tier"), str):
+                referenced_tiers.add(value["tier"])
+            for child in value.values():
+                collect_referenced(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect_referenced(child)
+
+    collect_referenced(roles)
+    for name in referenced_tiers:
+        spec = tiers.get(name)
+        if not isinstance(spec, dict) or spec.get("enabled") is not True:
+            raise ConfigureError(f"tier {name!r} is missing or disabled")
+        if (
+            not isinstance(spec.get("model"), str)
+            or not spec["model"].strip()
+            or not isinstance(spec.get("model_provider"), str)
+            or not spec["model_provider"].strip()
+        ):
+            raise ConfigureError(f"tier {name!r} has no portable provider/model")
+        efforts = spec.get("supported_efforts")
+        if (
+            not isinstance(efforts, list)
+            or not efforts
+            or not all(isinstance(item, str) and item.strip() for item in efforts)
+        ):
+            raise ConfigureError(f"tier {name!r} has invalid supported_efforts")
+    for name in profile.role_bindings:
+        binding = _role_table(roles, name)
+        if binding is None:
+            raise ConfigureError(f"role binding {name!r} is missing")
+        tier, effort = binding.get("tier"), binding.get("effort")
+        if (
+            not isinstance(tier, str)
+            or not tier.strip()
+            or not isinstance(effort, str)
+            or not effort.strip()
+            or tier not in tiers
+        ):
+            raise ConfigureError(f"role binding {name!r} is invalid")
+        supported = tiers[tier].get("supported_efforts", [])
+        if effort not in supported:
+            raise ConfigureError(f"role binding {name!r} requests unsupported effort {effort!r}")
+    return RegistryState(profile.key, tiers, roles)
+
+
+def _resolved_role(state: RegistryState, role: str) -> tuple[str, str, str]:
+    binding = _role_table(state.roles, role)
+    if binding is None:
+        raise ConfigureError(f"role binding {role!r} is missing")
+    tier_name, effort = binding["tier"], binding["effort"]
+    tier = state.tiers[tier_name]
+    return str(tier["model"]), str(effort), str(tier["model_provider"])
+
+
+def _validate_provider_bindings(state: RegistryState, roles: Iterable[str]) -> None:
+    _, _, main_provider = _resolved_role(state, "main")
+    for role in roles:
+        _, _, provider = _resolved_role(state, role)
+        if provider != main_provider:
+            raise ConfigureError(
+                f"role binding {role!r} uses provider {provider!r}, which differs from main provider "
+                f"{main_provider!r}; cross-provider materialization is refused"
+            )
+
+
+def _render_agent_asset(text: str, model: str, effort: str) -> str:
+    lines = text.splitlines(keepends=True)
+    model_indexes: list[int] = []
+    effort_indexes: list[int] = []
+    for index, line in enumerate(lines):
+        code, _ = _split_comment(_split_line_ending(line)[0])
+        if re.match(r"^\s*model\s*=", code):
+            model_indexes.append(index)
+        if re.match(r"^\s*model_reasoning_effort\s*=", code):
+            effort_indexes.append(index)
+    if len(model_indexes) != 1 or len(effort_indexes) != 1:
+        raise ConfigureError("agent asset has ambiguous model fields")
+    newline = _newline_for(text)
+    lines[model_indexes[0]] = f'model = {_render_value(model)}{newline}'
+    lines[effort_indexes[0]] = f'model_reasoning_effort = {_render_value(effort)}{newline}'
+    return "".join(lines)
+
+
+def _role_specs(home: Path, profile: Profile) -> tuple[RoleSpec, ...]:
+    pairs = (
+        ("code_mapper", "sol_luna_code_mapper.toml", "sol_luna_code_mapper", "read-only"),
+        ("implementation_worker", "sol_luna_implementation_worker.toml", "sol_luna_implementation_worker", "workspace-write"),
+    )
+    selected: list[RoleSpec] = []
+    for canonical_role, old_filename, old_name, sandbox in pairs:
+        canonical_filename = f"{canonical_role}.toml"
+        canonical_path = home / "agents" / canonical_filename
+        old_path = home / "agents" / old_filename
+        if old_path.exists() and canonical_path.exists():
+            raise ConfigureError(
+                f"both canonical and compatibility agent files exist for {canonical_role}; refusing ambiguous writers"
+            )
+        if old_path.exists():
+            # Upgrade old installations in place so a second writer is never created.
+            path_name, asset_name, expected = old_filename, old_filename, old_name
+        elif canonical_path.exists():
+            # Preserve an existing canonical installation even when the legacy
+            # profile is selected later; never create a second writer.
+            path_name, asset_name, expected = canonical_filename, canonical_filename, canonical_role
+        elif profile.key == "sol-luna":
+            path_name, asset_name, expected = old_filename, old_filename, old_name
+        else:
+            path_name, asset_name, expected = canonical_filename, canonical_filename, canonical_role
+        selected.append(RoleSpec(path_name, asset_name, expected, canonical_role, sandbox))
+    old_routine = home / "agents" / "sol_luna_routine_state_checker.toml"
+    canonical_routine = home / "agents" / "routine_state_checker.toml"
+    if old_routine.exists() and canonical_routine.exists():
+        raise ConfigureError("both canonical and compatibility routine checkers exist; refusing ambiguity")
+    if old_routine.exists():
+        selected.append(RoleSpec("sol_luna_routine_state_checker.toml", "routine_state_checker.toml", "sol_luna_routine_state_checker", "routine_state_checker", "read-only"))
+    else:
+        selected.append(RoleSpec("routine_state_checker.toml", "routine_state_checker.toml", "routine_state_checker", "routine_state_checker", "read-only"))
+    return tuple(selected)
+
+
+def _provider_compatible(config_text: str, state: RegistryState) -> None:
+    parsed = _parse_toml(config_text, CONFIG_NAME) if config_text else {}
+    # Native Codex defaults an omitted provider to OpenAI. Do not silently
+    # materialize a tier from another provider into that inherited config.
+    configured = parsed.get("model_provider", "openai")
+    _, _, expected = _resolved_role(state, "main")
+    if configured != expected:
+        raise ConfigureError(
+            f"config.toml model_provider {configured!r} does not match tier provider {expected!r}; "
+            "the installer will not rewrite providers or credentials"
+        )
+
+
+def _build_plan(home: Path, profile: Profile, *, sync_only: bool = False) -> Plan:
+    block, assets = _assets()
+    model_path, role_path = home / MODEL_TIERS_NAME, home / ROLE_BINDINGS_NAME
+    if sync_only:
+        model_exists, model_before = _read_optional_text(model_path)
+        role_exists, role_before = _read_optional_text(role_path)
+        if not model_exists or not role_exists:
+            raise ConfigureError("sync requires both existing model-tiers.toml and agent-tiers.toml")
+        model_after, role_after = model_before, role_before
+    else:
+        model_before, model_after = _registry_after(
+            model_path,
+            _registry_block(profile, roles=False),
+            MODEL_BEGIN,
+            MODEL_END,
+            profile.tier_models,
+            MODEL_TIERS_NAME,
+        )
+        role_before, role_after = _registry_after(
+            role_path,
+            _registry_block(profile, roles=True),
+            ROLES_BEGIN,
+            ROLES_END,
+            profile.role_bindings,
+            ROLE_BINDINGS_NAME,
+        )
+    state = _registry_state(model_after, role_after, profile)
+    _validate_provider_bindings(state, profile.role_bindings)
     config_path = home / CONFIG_NAME
     config_exists, config_before = _read_optional_text(config_path)
-    config_after = _config_after(config_before) if config_exists else _config_after("")
+    _provider_compatible(config_before if config_exists else "", state)
+    main_model, main_effort, _ = _resolved_role(state, "main")
+    default_model, default_effort, _ = _resolved_role(state, "default_subagent")
+    root_values = (("model", main_model), ("model_reasoning_effort", main_effort))
+    agents_values = (
+        ("default_subagent_model", default_model),
+        ("default_subagent_reasoning_effort", default_effort),
+    )
+    config_after = (
+        _config_after(config_before, root_values, agents_values)
+        if config_exists
+        else _config_after("", root_values, agents_values)
+    )
     instruction_path = _active_instruction_path(home)
     instruction_exists, instruction_before = _read_optional_text(instruction_path)
     instruction_after = _replace_marked_block(
         instruction_before if instruction_exists else "", AGENTS_BEGIN, AGENTS_END, block
     )
-    _assert_directory(home / "agents")
-    agent_paths: list[Path] = []
-    agent_before_after: list[tuple[Path, str, str]] = []
-    for filename, asset in agents.items():
-        role = Path(filename).stem
-        path = home / "agents" / filename
-        existed, before, after = _agent_after(path, asset, role)
-        agent_paths.append(path)
-        agent_before_after.append((path, before, after))
-        del existed
+    agents_dir = home / "agents"
+    _assert_directory(agents_dir)
+    targets: list[AgentTarget] = []
+    for spec in _role_specs(home, profile):
+        model, effort, provider = _resolved_role(state, spec.binding_name)
+        asset = _render_agent_asset(assets[spec.asset_name], model, effort)
+        path = agents_dir / spec.path_name
+        before, after = _agent_after(path, asset, Path(spec.path_name).stem)
+        targets.append(
+            AgentTarget(path, before, after, spec.expected_name, model, effort, provider, spec.sandbox_mode)
+        )
     return Plan(
         home=home,
+        profile=profile,
         config_path=config_path,
         instruction_path=instruction_path,
-        agent_paths=tuple(agent_paths),
+        model_tiers_path=model_path,
+        role_bindings_path=role_path,
         config_before=config_before,
         config_after=config_after,
         instruction_before=instruction_before,
         instruction_after=instruction_after,
-        agent_before_after=tuple(agent_before_after),
+        model_tiers_before=model_before,
+        model_tiers_after=model_after,
+        role_bindings_before=role_before,
+        role_bindings_after=role_after,
+        agent_targets=tuple(targets),
     )
 
 
-def _validate_config(text: str) -> None:
+def _validate_config(text: str, state: RegistryState) -> None:
     parsed = _parse_toml(text, CONFIG_NAME)
-    if parsed.get("model") != "gpt-5.6-sol":
-        raise ConfigureError("config.toml root model is not gpt-5.6-sol")
-    if parsed.get("model_reasoning_effort") != "max":
-        raise ConfigureError("config.toml root reasoning effort is not max")
+    main_model, main_effort, _ = _resolved_role(state, "main")
+    default_model, default_effort, _ = _resolved_role(state, "default_subagent")
+    if parsed.get("model") != main_model or parsed.get("model_reasoning_effort") != main_effort:
+        raise ConfigureError("config.toml main model/effort does not match the tier registry")
     agents = parsed.get("agents")
     if not isinstance(agents, dict):
         raise ConfigureError("config.toml has no [agents] table")
-    expected = dict(AGENTS_VALUES)
+    expected = dict(
+        (*BASE_AGENTS_VALUES,
+         ("default_subagent_model", default_model),
+         ("default_subagent_reasoning_effort", default_effort))
+    )
     for key, value in expected.items():
         if agents.get(key) != value:
             raise ConfigureError(f"[agents].{key} has an unexpected value")
     if "max_threads" in agents:
         raise ConfigureError("legacy [agents].max_threads is still active")
+    _provider_compatible(text, state)
 
 
-def _validate_agent(path: Path, expected_name: str, effort: str) -> None:
-    text = _read_text(path)
-    role = Path(path).stem
-    begin = _agent_marker(role, "BEGIN")
-    end = _agent_marker(role, "END")
-    if text.count(begin) != 1 or text.count(end) != 1:
-        raise ConfigureError(f"managed agent markers are incomplete: {path.name}")
-    parsed = _parse_toml(text, path.name, allow_multiline_strings=True)
-    if parsed.get("name") != expected_name:
-        raise ConfigureError(f"unexpected agent name: {path.name}")
-    if parsed.get("model") != "gpt-5.6-luna":
-        raise ConfigureError(f"unexpected agent model: {path.name}")
-    if parsed.get("model_reasoning_effort") != effort:
-        raise ConfigureError(f"unexpected agent reasoning effort: {path.name}")
-    if path.name.endswith("code_mapper.toml") and parsed.get("sandbox_mode") != "read-only":
-        raise ConfigureError(f"code mapper is not read-only: {path.name}")
-    if path.name.endswith("implementation_worker.toml") and parsed.get("sandbox_mode") != "workspace-write":
-        raise ConfigureError(f"implementation worker is not workspace-write: {path.name}")
+def _validate_agent(target: AgentTarget) -> None:
+    text = _read_text(target.path)
+    role = target.path.stem
+    if text.count(_agent_marker(role, "BEGIN")) != 1 or text.count(_agent_marker(role, "END")) != 1:
+        raise ConfigureError(f"managed agent markers are incomplete: {target.path.name}")
+    parsed = _parse_toml(text, target.path.name, allow_multiline_strings=True)
+    if parsed.get("name") != target.expected_name:
+        raise ConfigureError(f"unexpected agent name: {target.path.name}")
+    if parsed.get("model") != target.model or parsed.get("model_reasoning_effort") != target.effort:
+        raise ConfigureError(f"agent model/effort does not match tier registry: {target.path.name}")
+    if parsed.get("sandbox_mode") != target.sandbox_mode:
+        raise ConfigureError(f"unexpected sandbox mode: {target.path.name}")
     if not isinstance(parsed.get("developer_instructions"), str):
-        raise ConfigureError(f"agent instructions are missing: {path.name}")
+        raise ConfigureError(f"agent instructions are missing: {target.path.name}")
 
 
-def _validate_agents_block(path: Path) -> None:
-    text = _read_text(path)
-    if text.count(AGENTS_BEGIN) != 1 or text.count(AGENTS_END) != 1:
-        raise ConfigureError(f"active AGENTS managed block is incomplete: {path.name}")
-
-
-def _verify_static(home: Path) -> Plan:
-    plan = _build_plan(home)
-    if not plan.config_path.is_file():
-        raise ConfigureError("global config.toml is missing")
-    _validate_config(_read_text(plan.config_path))
-    _validate_agents_block(plan.instruction_path)
-    _validate_agent(plan.agent_paths[0], "sol_luna_code_mapper", "medium")
-    _validate_agent(plan.agent_paths[1], "sol_luna_implementation_worker", "max")
+def _verify_static(home: Path, profile: Profile) -> Plan:
+    plan = _build_plan(home, profile, sync_only=True)
+    state = _registry_state(plan.model_tiers_after, plan.role_bindings_after, profile)
+    _validate_config(_read_text(plan.config_path), state)
+    instruction_text = _read_text(plan.instruction_path)
+    if instruction_text.count(AGENTS_BEGIN) != 1 or instruction_text.count(AGENTS_END) != 1:
+        raise ConfigureError(f"active AGENTS managed block is incomplete: {plan.instruction_path.name}")
+    for target in plan.agent_targets:
+        _validate_agent(target)
     return plan
 
 
@@ -563,7 +960,6 @@ def _timestamped_backup(plan: Plan) -> tuple[Path, dict[str, Any]]:
     root = plan.home / "backups" / "configure-sol-luna-subagents"
     _assert_directory(plan.home / "backups")
     _assert_directory(root)
-    _assert_safe_parent(root / "placeholder", plan.home)
     root.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup = root / timestamp
@@ -591,14 +987,15 @@ def _timestamped_backup(plan: Plan) -> tuple[Path, dict[str, Any]]:
             record["backup"] = backup_relative.as_posix()
         records.append(record)
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "codex_home": str(plan.home),
+        "profile": plan.profile.key,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "files": records,
     }
     _atomic_write(
         backup / "manifest.json",
-        (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+        (json.dumps(manifest, indent=2) + "\n").encode("utf-8"),
         mode=0o600,
         root=backup,
     )
@@ -619,7 +1016,7 @@ def _manifest_records(home: Path, backup_arg: str) -> tuple[Path, dict[str, Any]
         manifest = json.loads(_read_text(manifest_path))
     except json.JSONDecodeError as exc:
         raise ConfigureError("backup manifest is invalid JSON") from exc
-    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+    if not isinstance(manifest, dict) or manifest.get("schema") not in (1, 2):
         raise ConfigureError("unsupported backup manifest")
     if manifest.get("codex_home") != str(home):
         raise ConfigureError("backup CODEX_HOME does not match the requested CODEX_HOME")
@@ -654,9 +1051,8 @@ def _manifest_records(home: Path, backup_arg: str) -> tuple[Path, dict[str, Any]
 
 def _rollback_manifest(home: Path, backup_arg: str) -> int:
     backup, manifest = _manifest_records(home, backup_arg)
-    records = manifest["files"]
     validated: list[tuple[dict[str, Any], Path, Path | None]] = []
-    for record in records:
+    for record in manifest["files"]:
         target = home / Path(record["path"])
         _assert_safe_parent(target, home)
         if target.is_symlink() or (target.exists() and not target.is_file()):
@@ -701,99 +1097,225 @@ def _run_codex_check(home: Path) -> None:
     except subprocess.TimeoutExpired as exc:
         raise ConfigureError("codex features list timed out") from exc
     if result.returncode != 0:
-        raise ConfigureError("codex features list could not load the global configuration")
+        raise ConfigureError("codex features list could not parse the global configuration")
 
 
-def _status(path: Path) -> str:
-    if path.is_file():
-        return "present"
-    return "missing"
+def _planned_content(plan: Plan, path: Path) -> str:
+    mapping = {
+        plan.config_path: plan.config_after,
+        plan.instruction_path: plan.instruction_after,
+        plan.model_tiers_path: plan.model_tiers_after,
+        plan.role_bindings_path: plan.role_bindings_after,
+    }
+    if path in mapping:
+        return mapping[path]
+    for target in plan.agent_targets:
+        if target.path == path:
+            return target.after
+    raise ConfigureError(f"internal plan target is unknown: {path}")
 
 
-def _print_audit(plan: Plan) -> None:
-    print("AUDIT OK")
-    print(f"CODEX_HOME: {plan.home}")
-    print(f"config.toml: {_status(plan.config_path)}")
-    print(f"active instructions: {plan.instruction_path.name} ({_status(plan.instruction_path)})")
-    for path in plan.agent_paths:
-        print(f"agent {path.name}: {_status(path)}")
-    print("planned scope: global config, active AGENTS file, and two namespaced agents")
+def _changed_paths(plan: Plan) -> list[Path]:
+    changed: list[Path] = []
+    for path in plan.targets:
+        content = _planned_content(plan, path)
+        if not path.exists() or _read_text(path) != content:
+            changed.append(path)
+    return changed
 
 
-def _cmd_audit(home: Path) -> int:
-    _print_audit(_build_plan(home))
-    return 0
+def _confirm(plan: Plan, *, yes: bool) -> bool:
+    changed = _changed_paths(plan)
+    if not changed:
+        print(f"NOOP: {plan.profile.display_name} is already synchronized")
+        return False
+    _print_audit(plan, preview=True)
+    print(f"About to update {len(changed)} file(s) below CODEX_HOME for {plan.profile.display_name}:")
+    for path in changed:
+        print(f"  - {path.relative_to(plan.home)}")
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        raise ConfigureError("apply/sync requires --yes in a non-interactive session")
+    answer = input("Apply this plan? [y/N]: ").strip().lower()
+    if answer not in {"y", "yes"}:
+        raise ConfigureError("operation cancelled; no files were changed")
+    return True
 
 
-def _cmd_apply(home: Path, run_codex: bool) -> int:
-    _ensure_home_for_apply(home)
-    plan = _build_plan(home)
+def _write_plan(plan: Plan) -> int:
+    changed = 0
+    for path in plan.targets:
+        content = _planned_content(plan, path)
+        if not path.exists() or _read_text(path) != content:
+            _atomic_write(
+                path,
+                content.encode("utf-8"),
+                mode=_target_mode(path),
+                root=plan.home,
+            )
+            changed += 1
+    return changed
+
+
+def _apply_plan(plan: Plan, *, run_codex: bool) -> tuple[int, Path]:
     backup, _ = _timestamped_backup(plan)
     try:
-        writes: list[tuple[Path, str]] = [(plan.config_path, plan.config_after), (plan.instruction_path, plan.instruction_after)]
-        writes.extend((path, after) for path, _, after in plan.agent_before_after)
-        changed = 0
-        for path, content in writes:
-            if not path.exists() or _read_text(path) != content:
-                _atomic_write(
-                    path,
-                    content.encode("utf-8"),
-                    mode=_target_mode(path),
-                    root=home,
-                )
-                changed += 1
-        _verify_static(home)
+        changed = _write_plan(plan)
+        _verify_static(plan.home, plan.profile)
         if run_codex:
-            _run_codex_check(home)
+            _run_codex_check(plan.home)
     except Exception as exc:
         try:
-            _rollback_manifest(home, str(backup))
+            _rollback_manifest(plan.home, str(backup))
         except Exception as rollback_exc:
             raise ConfigureError(
-                f"apply validation failed ({exc}); automatic rollback also failed ({rollback_exc})"
+                f"validation failed ({exc}); automatic rollback also failed ({rollback_exc})"
             ) from exc
         if isinstance(exc, ConfigureError):
-            raise ConfigureError(f"apply validation failed; automatic rollback completed: {exc}") from exc
+            raise ConfigureError(
+                f"validation failed; automatic rollback completed: {exc}"
+            ) from exc
         raise ConfigureError(f"apply failed; automatic rollback completed: {exc}") from exc
-    print(f"APPLY OK: changed {changed} file(s)")
-    print(f"backup: {backup}")
-    print("next step: run verify --run-codex, then start a new Codex session or restart the client")
+    return changed, backup
+
+
+def _print_audit(plan: Plan, *, preview: bool = False) -> None:
+    print("PREVIEW OK" if preview else "AUDIT OK")
+    print(f"CODEX_HOME: {plan.home}")
+    print(f"profile: {plan.profile.key}")
+    state = _registry_state(plan.model_tiers_after, plan.role_bindings_after, plan.profile)
+    main_model, main_effort, main_provider = _resolved_role(state, "main")
+    default_model, default_effort, default_provider = _resolved_role(state, "default_subagent")
+    print(f"resolved main: {main_model} / {main_effort} / provider={main_provider}")
+    print(f"resolved default_subagent: {default_model} / {default_effort} / provider={default_provider}")
+    for label, path in (
+        ("config.toml", plan.config_path),
+        ("active instructions", plan.instruction_path),
+        (MODEL_TIERS_NAME, plan.model_tiers_path),
+        (ROLE_BINDINGS_NAME, plan.role_bindings_path),
+    ):
+        print(f"{label}: {'present' if path.is_file() else 'missing'}")
+    for target in plan.agent_targets:
+        print(
+            f"agent {target.path.name}: "
+            f"{'present' if target.path.is_file() else 'missing'} "
+            f"({target.model} / {target.effort} / provider={target.provider} / {target.sandbox_mode})"
+        )
+    print("planned scope: global config, active instructions, portable tier registries, and managed agents")
+    if preview:
+        print(f"would change: {len(_changed_paths(plan))} file(s); no files were written")
+
+
+def _cmd_audit(home: Path, profile: Profile, *, preview: bool = False) -> int:
+    plan = _build_plan(home, profile)
+    _print_audit(plan, preview=preview)
     return 0
 
 
-def _cmd_verify(home: Path, run_codex: bool) -> int:
-    _verify_static(home)
+def _cmd_apply(
+    home: Path,
+    profile: Profile,
+    *,
+    yes: bool,
+    run_codex: bool,
+    sync_only: bool = False,
+) -> int:
+    # Keep a cancelled/non-interactive preview genuinely non-mutating; the
+    # home directory is created only after confirmation succeeds.
+    plan = _build_plan(home, profile, sync_only=sync_only)
+    if not _confirm(plan, yes=yes):
+        return 0
+    if not sync_only:
+        _ensure_home_for_apply(home)
+    changed, backup = _apply_plan(plan, run_codex=run_codex)
+    print(f"{'SYNC' if sync_only else 'APPLY'} OK: changed {changed} file(s)")
+    print(f"backup: {backup}")
+    print("next step: run verify, then start a new Codex session or restart the client")
+    return 0
+
+
+def _cmd_verify(home: Path, profile: Profile, run_codex: bool) -> int:
+    _verify_static(home, profile)
     if run_codex:
         _run_codex_check(home)
     print("VERIFY OK: static configuration and managed files are valid")
     if run_codex:
-        print("codex load: OK")
+        print("codex parse check: OK (this is not a paid model smoke test)")
     return 0
 
 
-def _add_home_option(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--codex-home",
-        metavar="PATH",
-        help="global Codex home; defaults to CODEX_HOME or ~/.codex",
-    )
+def _cmd_tiers(home: Path, action: str, profile: Profile) -> int:
+    model_path, role_path = home / MODEL_TIERS_NAME, home / ROLE_BINDINGS_NAME
+    if action == "list":
+        for path in (model_path, role_path):
+            if path.is_file():
+                parsed = _parse_toml(_read_text(path), path.name, allow_multiline_strings=True)
+                print(f"{path.name}: present ({len(parsed)} top-level table(s))")
+            else:
+                print(f"{path.name}: missing")
+        return 0
+    if not model_path.is_file() or not role_path.is_file():
+        raise ConfigureError("tier check requires both registry files; run preview, then apply")
+    state = _registry_state(_read_text(model_path), _read_text(role_path), profile)
+    print(f"TIER CHECK OK: profile={state.profile}, tiers={len(state.tiers)}, roles={len(state.roles)}")
+    return 0
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("audit", "apply", "verify"):
-        command = commands.add_parser(name)
-        _add_home_option(command)
-        if name in ("apply", "verify"):
+    commands = parser.add_subparsers(dest="command")
+
+    def common(
+        command: argparse.ArgumentParser,
+        *,
+        confirmation: bool = False,
+        run_codex: bool = False,
+    ) -> None:
+        command.add_argument(
+            "--codex-home",
+            metavar="PATH",
+            help="global Codex home; defaults to CODEX_HOME or ~/.codex",
+        )
+        command.add_argument(
+            "--profile",
+            choices=tuple(PROFILE_ALIASES),
+            default=None,
+            help="astra-luna (default) or legacy sol-luna",
+        )
+        if confirmation:
+            command.add_argument(
+                "--yes",
+                action="store_true",
+                help="confirm the exact planned write without prompting",
+            )
+        if run_codex:
             command.add_argument(
                 "--run-codex",
                 action="store_true",
-                help="also run codex features list; no model task is started",
+                help="also run codex features list as a parse check",
             )
+
+    for name in ("audit", "preview"):
+        common(commands.add_parser(name))
+    common(commands.add_parser("apply"), confirmation=True, run_codex=True)
+    common(commands.add_parser("verify"), run_codex=True)
+    common(commands.add_parser("sync"), confirmation=True, run_codex=True)
     rollback = commands.add_parser("rollback")
-    _add_home_option(rollback)
+    rollback.add_argument(
+        "--codex-home",
+        metavar="PATH",
+        help="global Codex home; defaults to CODEX_HOME or ~/.codex",
+    )
     rollback.add_argument("--backup", required=True, metavar="PATH")
+    tiers = commands.add_parser("tiers")
+    tiers.add_argument("action", choices=("list", "check"))
+    tiers.add_argument(
+        "--codex-home",
+        metavar="PATH",
+        help="global Codex home; defaults to CODEX_HOME or ~/.codex",
+    )
+    tiers.add_argument("--profile", choices=tuple(PROFILE_ALIASES), default=None)
     return parser
 
 
@@ -801,17 +1323,37 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
         _require_tomllib()
-        home = _home_from_arg(args.codex_home)
-        if args.command == "audit":
-            return _cmd_audit(home)
-        if args.command == "apply":
-            return _cmd_apply(home, args.run_codex)
-        if args.command == "verify":
-            return _cmd_verify(home, args.run_codex)
+        home = _home_from_arg(getattr(args, "codex_home", None))
+        if args.command is None:
+            return _cmd_audit(home, _profile(None, home=home), preview=True)
         if args.command == "rollback":
             restored = _rollback_manifest(home, args.backup)
             print(f"ROLLBACK OK: restored {restored} manifest file(s)")
+            print("Note: rollback restores the backup scope and may overwrite later edits to those files.")
             return 0
+        profile = _profile(
+            getattr(args, "profile", None),
+            home=home,
+            auto=args.command in {"sync", "verify", "tiers"},
+        )
+        if args.command == "audit":
+            return _cmd_audit(home, profile)
+        if args.command == "preview":
+            return _cmd_audit(home, profile, preview=True)
+        if args.command == "apply":
+            return _cmd_apply(home, profile, yes=args.yes, run_codex=args.run_codex)
+        if args.command == "sync":
+            return _cmd_apply(
+                home,
+                profile,
+                yes=args.yes,
+                run_codex=args.run_codex,
+                sync_only=True,
+            )
+        if args.command == "verify":
+            return _cmd_verify(home, profile, args.run_codex)
+        if args.command == "tiers":
+            return _cmd_tiers(home, args.action, profile)
         raise ConfigureError(f"unknown command: {args.command}")
     except ConfigureError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
