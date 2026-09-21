@@ -608,4 +608,154 @@ def _registry_after(
         suffix = "" if not before or before.endswith(("\n", "\r")) else "\n"
         return before, before + suffix + "\n" + desired
     if begin_count != 1 or end_count != 1:
-        raise ConfigureError(f"manag
+        raise ConfigureError(f"managed registry block is incomplete in {path.name}")
+    marker_block = before[before.find(begin): before.find(end) + len(end)]
+    match = PROFILE_RE.search(marker_block)
+    desired_match = PROFILE_RE.search(desired)
+    if match is None or desired_match is None:
+        raise ConfigureError(f"managed registry profile is missing in {path.name}")
+    if match.group(1) == desired_match.group(1):
+        # Existing managed values are the editable source of truth.
+        return before, before
+    return before, _replace_marked_block(before, begin, end, desired)
+
+
+def _role_table(roles: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:
+    direct = roles.get(name)
+    if isinstance(direct, dict):
+        return direct
+    current: Any = roles
+    for part in name.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current if isinstance(current, dict) else None
+
+
+def _registry_state(model_text: str, role_text: str, profile: Profile) -> RegistryState:
+    model = _parse_toml(model_text, MODEL_TIERS_NAME, allow_multiline_strings=True)
+    roles_doc = _parse_toml(role_text, ROLE_BINDINGS_NAME, allow_multiline_strings=True)
+    model_match = PROFILE_RE.search(model_text)
+    role_match = PROFILE_RE.search(role_text)
+    if not model_match or not role_match or model_match.group(1) != role_match.group(1):
+        raise ConfigureError("model-tiers.toml and agent-tiers.toml have no matching managed profile")
+    if model_match.group(1) != profile.key:
+        raise ConfigureError(
+            f"registry profile is {model_match.group(1)!r}, but requested profile is {profile.key!r}"
+        )
+    tiers = model.get("tiers")
+    roles = roles_doc.get("roles")
+    if not isinstance(tiers, dict) or not isinstance(roles, dict):
+        raise ConfigureError("tier registries must contain [tiers.*] and [roles.*] tables")
+    referenced_tiers = set(profile.tier_models)
+    for name in profile.role_bindings:
+        binding = _role_table(roles, name)
+        if isinstance(binding, dict) and isinstance(binding.get("tier"), str):
+            referenced_tiers.add(binding["tier"])
+
+    def collect_referenced(value: Any) -> None:
+        if isinstance(value, dict):
+            if isinstance(value.get("tier"), str):
+                referenced_tiers.add(value["tier"])
+            for child in value.values():
+                collect_referenced(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect_referenced(child)
+
+    collect_referenced(roles)
+    for name in referenced_tiers:
+        spec = tiers.get(name)
+        if not isinstance(spec, dict) or spec.get("enabled") is not True:
+            raise ConfigureError(f"tier {name!r} is missing or disabled")
+        if (
+            not isinstance(spec.get("model"), str)
+            or not spec["model"].strip()
+            or not isinstance(spec.get("model_provider"), str)
+            or not spec["model_provider"].strip()
+        ):
+            raise ConfigureError(f"tier {name!r} has no portable provider/model")
+        efforts = spec.get("supported_efforts")
+        if (
+            not isinstance(efforts, list)
+            or not efforts
+            or not all(isinstance(item, str) and item.strip() for item in efforts)
+        ):
+            raise ConfigureError(f"tier {name!r} has invalid supported_efforts")
+    for name in profile.role_bindings:
+        binding = _role_table(roles, name)
+        if binding is None:
+            raise ConfigureError(f"role binding {name!r} is missing")
+        tier, effort = binding.get("tier"), binding.get("effort")
+        if (
+            not isinstance(tier, str)
+            or not tier.strip()
+            or not isinstance(effort, str)
+            or not effort.strip()
+            or tier not in tiers
+        ):
+            raise ConfigureError(f"role binding {name!r} is invalid")
+        supported = tiers[tier].get("supported_efforts", [])
+        if effort not in supported:
+            raise ConfigureError(f"role binding {name!r} requests unsupported effort {effort!r}")
+    return RegistryState(profile.key, tiers, roles)
+
+
+def _resolved_role(state: RegistryState, role: str) -> tuple[str, str, str]:
+    binding = _role_table(state.roles, role)
+    if binding is None:
+        raise ConfigureError(f"role binding {role!r} is missing")
+    tier_name, effort = binding["tier"], binding["effort"]
+    tier = state.tiers[tier_name]
+    return str(tier["model"]), str(effort), str(tier["model_provider"])
+
+
+def _validate_provider_bindings(state: RegistryState, roles: Iterable[str]) -> None:
+    _, _, main_provider = _resolved_role(state, "main")
+    for role in roles:
+        _, _, provider = _resolved_role(state, role)
+        if provider != main_provider:
+            raise ConfigureError(
+                f"role binding {role!r} uses provider {provider!r}, which differs from main provider "
+                f"{main_provider!r}; cross-provider materialization is refused"
+            )
+
+
+def _render_agent_asset(text: str, model: str, effort: str) -> str:
+    lines = text.splitlines(keepends=True)
+    model_indexes: list[int] = []
+    effort_indexes: list[int] = []
+    for index, line in enumerate(lines):
+        code, _ = _split_comment(_split_line_ending(line)[0])
+        if re.match(r"^\s*model\s*=", code):
+            model_indexes.append(index)
+        if re.match(r"^\s*model_reasoning_effort\s*=", code):
+            effort_indexes.append(index)
+    if len(model_indexes) != 1 or len(effort_indexes) != 1:
+        raise ConfigureError("agent asset has ambiguous model fields")
+    newline = _newline_for(text)
+    lines[model_indexes[0]] = f'model = {_render_value(model)}{newline}'
+    lines[effort_indexes[0]] = f'model_reasoning_effort = {_render_value(effort)}{newline}'
+    return "".join(lines)
+
+
+def _role_specs(home: Path, profile: Profile) -> tuple[RoleSpec, ...]:
+    pairs = (
+        ("code_mapper", "sol_luna_code_mapper.toml", "sol_luna_code_mapper", "read-only"),
+        ("implementation_worker", "sol_luna_implementation_worker.toml", "sol_luna_implementation_worker", "workspace-write"),
+    )
+    selected: list[RoleSpec] = []
+    for canonical_role, old_filename, old_name, sandbox in pairs:
+        canonical_filename = f"{canonical_role}.toml"
+        canonical_path = home / "agents" / canonical_filename
+        old_path = home / "agents" / old_filename
+        if old_path.exists() and canonical_path.exists():
+            raise ConfigureError(
+                f"both canonical and compatibility agent files exist for {canonical_role}; refusing ambiguous writers"
+            )
+        if old_path.exists():
+            # Upgrade old installations in place so a second writer is never created.
+            path_name, asset_name, expected = old_filename, old_filename, old_name
+        elif canonical_path.exists():
+            # Preserve an existing canonical installation even when the legacy
+        
