@@ -520,3 +520,92 @@ def _active_instruction_path(home: Path) -> Path:
         raise ConfigureError(f"invalid active instruction candidate: {base}")
     return base
 
+
+def _assets() -> tuple[str, dict[str, str]]:
+    block_path = ASSETS_DIR / "AGENTS.block.md"
+    if not block_path.is_file():
+        raise ConfigureError("missing bundled AGENTS block asset")
+    block = _read_text(block_path)
+    if AGENTS_BEGIN not in block or AGENTS_END not in block:
+        raise ConfigureError("bundled AGENTS block markers are incomplete")
+    names = (
+        "code_mapper.toml",
+        "implementation_worker.toml",
+        "routine_state_checker.toml",
+        "sol_luna_code_mapper.toml",
+        "sol_luna_implementation_worker.toml",
+    )
+    assets: dict[str, str] = {}
+    for name in names:
+        path = ASSETS_DIR / name
+        if not path.is_file():
+            raise ConfigureError(f"missing bundled agent asset: {name}")
+        assets[name] = _read_text(path)
+    return block, assets
+
+
+def _profile(value: str | None, *, home: Path | None = None, auto: bool = False) -> Profile:
+    if auto and value is None and home is not None:
+        model_path = home / MODEL_TIERS_NAME
+        if model_path.is_file():
+            match = PROFILE_RE.search(_read_text(model_path))
+            if match and match.group(1) in PROFILES:
+                return PROFILES[match.group(1)]
+    key = PROFILE_ALIASES.get(value or "astra-luna")
+    if key is None:
+        raise ConfigureError(f"unknown profile {value!r}; choose astra-luna or sol-luna")
+    return PROFILES[key]
+
+
+def _registry_block(profile: Profile, *, roles: bool) -> str:
+    begin, end = (ROLES_BEGIN, ROLES_END) if roles else (MODEL_BEGIN, MODEL_END)
+    lines = [begin, f"# profile: {profile.key}"]
+    if not roles:
+        lines.append("# Tiers select provider/model only; role permissions stay in agent TOML files.")
+        for tier, (provider, model, efforts) in profile.tier_models.items():
+            lines.extend(
+                [
+                    "",
+                    f"[tiers.{tier}]",
+                    "enabled = true",
+                    f"model_provider = {_render_value(provider)}",
+                    f"model = {_render_value(model)}",
+                    f"supported_efforts = {_render_value(efforts)}",
+                ]
+            )
+    else:
+        lines.append("# Tier bindings select model/effort; sandbox and authority stay in agent TOML files.")
+        for role, (tier, effort) in profile.role_bindings.items():
+            table = f'[roles."{role}"]' if "." in role else f"[roles.{role}]"
+            lines.extend(["", table, f"tier = {_render_value(tier)}", f"effort = {_render_value(effort)}"])
+    lines.append(end)
+    return "\n".join(lines) + "\n"
+
+
+def _registry_after(
+    path: Path,
+    desired: str,
+    begin: str,
+    end: str,
+    target_names: Iterable[str],
+    label: str,
+) -> tuple[str, str]:
+    existed, before = _read_optional_text(path)
+    if not existed:
+        return before, desired
+    _parse_toml(before, label, allow_multiline_strings=True)
+    begin_count, end_count = before.count(begin), before.count(end)
+    if begin_count == 0 and end_count == 0:
+        parsed = _parse_toml(before, label, allow_multiline_strings=True)
+        container_name = "roles" if begin == ROLES_BEGIN else "tiers"
+        container = parsed.get(container_name)
+        if isinstance(container, dict) and (
+            any(_role_table(container, name) is not None for name in target_names)
+            if begin == ROLES_BEGIN
+            else any(name in container for name in target_names)
+        ):
+            raise ConfigureError(f"unmanaged registry collision in {path.name}")
+        suffix = "" if not before or before.endswith(("\n", "\r")) else "\n"
+        return before, before + suffix + "\n" + desired
+    if begin_count != 1 or end_count != 1:
+        raise ConfigureError(f"manag
