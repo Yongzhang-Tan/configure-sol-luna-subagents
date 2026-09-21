@@ -435,4 +435,88 @@ def _config_after(
                     lines[agent_assignments[key]], key, value
                 )
             else:
-  
+                missing_agents.append((key, value))
+        remove_index = None
+        if "max_threads" in agents_value:
+            if "max_threads" not in agent_assignments:
+                raise ConfigureError("[agents].max_threads uses an unsupported complex layout")
+            remove_index = agent_assignments["max_threads"]
+        replacements_all = {**replacements, **replacements_agents}
+        new_lines = [
+            replacements_all.get(index, line)
+            for index, line in enumerate(lines)
+            if index != remove_index
+        ]
+        if missing_root:
+            first_header_after, _ = _section_ranges(new_lines)
+            new_lines[first_header_after:first_header_after] = _line_block(
+                missing_root, newline
+            )
+        if missing_agents:
+            _, sections_after = _section_ranges(new_lines)
+            exact = [
+                section
+                for section in sections_after
+                if section[2] == "table" and section[3] == "agents"
+            ]
+            if len(exact) != 1:
+                raise ConfigureError("cannot locate the updated [agents] section")
+            new_lines[exact[0][1]:exact[0][1]] = _line_block(missing_agents, newline)
+        return "".join(new_lines)
+
+    if agents_value is not None:
+        raise ConfigureError("agents is not a simple [agents] table; refusing to guess")
+    new_lines = [replacements.get(index, line) for index, line in enumerate(lines)]
+    if missing_root:
+        first_header_after, _ = _section_ranges(new_lines)
+        new_lines[first_header_after:first_header_after] = _line_block(missing_root, newline)
+    return _append_section("".join(new_lines), all_agent_values, newline)
+
+
+def _replace_marked_block(text: str, begin: str, end: str, replacement: str) -> str:
+    newline = _newline_for(text or replacement)
+    replacement = replacement.rstrip("\r\n").replace("\n", newline) + newline
+    begin_count = text.count(begin)
+    end_count = text.count(end)
+    if begin_count == 0 and end_count == 0:
+        if text and not text.endswith(("\n", "\r")):
+            text += newline
+        return text + replacement
+    if begin_count != 1 or end_count != 1:
+        raise ConfigureError("managed block has duplicate or incomplete markers")
+    begin_at = text.find(begin)
+    end_at = text.find(end)
+    if end_at <= begin_at:
+        raise ConfigureError("managed block markers are out of order")
+    start = text.rfind("\n", 0, begin_at) + 1
+    end_line = text.find("\n", end_at)
+    end_position = len(text) if end_line == -1 else end_line + 1
+    return text[:start] + replacement + text[end_position:]
+
+
+def _agent_marker(role: str, side: str) -> str:
+    return f"# {side} MANAGED: {AGENT_MARKER_PREFIX}{role}"
+
+
+def _agent_after(path: Path, asset_text: str, role: str) -> tuple[str, str]:
+    existed, before = _read_optional_text(path)
+    begin = _agent_marker(role, "BEGIN")
+    end = _agent_marker(role, "END")
+    if not existed:
+        return before, asset_text
+    if begin not in before and end not in before:
+        raise ConfigureError(f"unmanaged agent collision: {path.name}")
+    return before, _replace_marked_block(before, begin, end, asset_text)
+
+
+def _active_instruction_path(home: Path) -> Path:
+    override = home / OVERRIDE_NAME
+    if override.is_symlink() or (override.exists() and not override.is_file()):
+        raise ConfigureError(f"invalid active instruction candidate: {override}")
+    if override.exists() and _read_text(override).strip():
+        return override
+    base = home / AGENTS_NAME
+    if base.is_symlink() or (base.exists() and not base.is_file()):
+        raise ConfigureError(f"invalid active instruction candidate: {base}")
+    return base
+
