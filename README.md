@@ -1,108 +1,129 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-# Configure Sol → Luna Subagents
+# Configure Astra → Luna Subagents
 
-Worried about running out of Codex credits? Make every Sol call count: let Sol
-handle planning, review, and final decisions, while Luna takes on well-bounded
-execution tasks. The escalation path back to Sol remains available, and this
-design is intended to reduce unnecessary top-tier-model calls.
+This repository ships an explicit-only Codex skill and a small, portable
+global configurator. The default profile is:
 
-*Actual credit usage depends on the task, call count, account plan, and pricing;
-this project promises no fixed savings.*
+- T1/main: `gpt-6-astra`, medium effort.
+- T2/default, mapper, and implementation worker: `gpt-5.6-luna`, max effort.
+- T3/routine state checker: `gpt-5.6-luna`, max effort.
+- `implementation_worker` is the only write-capable role; mapper and routine
+  checker are read-only.
 
-This repository provides a cross-platform Codex skill for a small global
-subagent baseline: the main thread uses Sol, and two narrowly scoped agents use
-Luna. It changes only the global Codex home. It does not scan or edit project
-directories, project instructions, skills, hooks, MCP servers, providers,
-trust settings, approvals, or sandbox settings.
+The model registry selects provider/model and supported effort only. Sandbox,
+instructions, and authority remain in each agent TOML file. The installer
+preserves unrelated config, roles, provider definitions, hooks, MCP servers,
+and project registrations. It does not scan or edit projects.
 
-The skill is intended for Linux, macOS, and Windows. Python 3.11 or newer is
-recommended because it includes the standard-library `tomllib` parser. Python
-3.10 is also supported when `tomli` is already installed. The skill never
-installs dependencies automatically; report the missing parser if neither is
-available.
-Model access must already be available to the Codex client.
+Actual model and effort availability is client/account dependent. Before
+applying, inspect the models and reasoning efforts supported by your Codex
+client. If the requested profile is unavailable, ask the user before choosing
+any substitute. A successful static/config parse is not a paid live model
+test and does not prove access or billing availability.
 
-## Install and use
+## Install the skill
 
-The final skill URL is:
+The existing shareable URL and skill entry remain valid:
 
 `https://github.com/Yongzhang-Tan/configure-sol-luna-subagents/tree/main/skills/configure-sol-luna-subagents`
 
-### One-message entry point
+One-message entry point:
 
-Ask Codex:
+`$skill-installer Install <https://github.com/Yongzhang-Tan/configure-sol-luna-subagents/tree/main/skills/configure-sol-luna-subagents> and then use $configure-sol-luna-subagents.`
 
-`$skill-installer Install <https://github.com/Yongzhang-Tan/configure-sol-luna-subagents/tree/main/skills/configure-sol-luna-subagents> and immediately run configure-sol-luna-subagents according to its SKILL.md.`
+Or use the standard two-step flow:
 
-This relies on the current Codex client discovering and reading the newly
-installed skill in the same turn. If skill discovery is delayed, use the
-standard two-step entry point instead.
+1. `$skill-installer Install <https://github.com/Yongzhang-Tan/configure-sol-luna-subagents/tree/main/skills/configure-sol-luna-subagents>`
+2. `$configure-sol-luna-subagents`
 
-### Standard two-step entry point
+The skill remains explicit-only. Installing the skill stores its files under
+the client's skill location; it does not apply this global configuration.
 
-First turn:
+## Safe workflow
 
-`$skill-installer Install <https://github.com/Yongzhang-Tan/configure-sol-luna-subagents/tree/main/skills/configure-sol-luna-subagents>`
-
-Next turn:
-
-`$configure-sol-luna-subagents`
-
-The skill defaults to the global install action. It identifies `CODEX_HOME`
-from the environment, or falls back to `~/.codex`. Invocation is authorization
-for this exact global configuration change, so it does not ask for a second
-confirmation. It stops instead when it finds an invalid TOML file, an
-unmanaged collision with either namespaced agent, a malformed managed block, or
-another ambiguity that could make a safe merge impossible.
-
-After a successful install, start a new Codex session or restart the client so
-the global configuration is loaded. Existing sessions do not retroactively
-change their already-loaded agent configuration.
-
-## FAQ: What does installation enable?
-
-Installing the skill only makes the configurator available; it does not apply
-the global configuration. Use the one-message install-and-run entry above, or
-invoke `$configure-sol-luna-subagents` after installation, then start a new
-Codex session or restart the client. Once the configuration is loaded, Codex
-may automatically delegate eligible nontrivial mapping and well-bounded
-implementation work to Luna without an explicit per-task delegation prompt.
-Trivial work stays in Sol, and not every task is forced to use a subagent.
-Project `AGENTS.md`/instructions and client capabilities may refine or override
-this routing.
-
-## Resulting baseline
-
-- Main thread: `gpt-5.6-sol`, maximum reasoning.
-- `sol_luna_code_mapper`: `gpt-5.6-luna`, medium reasoning, read-only.
-- `sol_luna_implementation_worker`: `gpt-5.6-luna`, maximum reasoning, workspace-write.
-- At most one implementation writer is active.
-- The Luna worker may receive one focused correction for a concrete defect or
-  failed verification; if it still cannot finish, the Sol main thread reviews,
-  replans, or completes the task.
-- Subagents do not gain authority to delegate, access remote systems, install
-  packages, or perform destructive actions.
-
-The native configuration also removes the active `[agents].max_threads` legacy
-key and sets `max_depth = 1` plus
-`max_concurrent_threads_per_session = 3`. Unrelated configuration is retained.
-
-## Manual commands
-
-From the skill directory:
+Run the script from the skill directory. `CODEX_HOME` may be supplied through
+the environment or `--codex-home`; tests and examples should use a temporary
+directory.
 
 ```bash
-python scripts/configure.py audit
-python scripts/configure.py apply --run-codex
+python scripts/configure.py              # preview; no write
+python scripts/configure.py audit        # read-only scope audit
+python scripts/configure.py preview     # read-only resolved plan
+python scripts/configure.py apply --yes  # explicit confirmation
 python scripts/configure.py verify
+```
+
+After showing the preview, obtain user approval for the exact plan immediately
+before writing. When the client provides a one-to-three-question input UI, use
+it for preferences; otherwise ask in ordinary dialogue. `--yes` is only the
+confirmation flag after that approval. Without it, `apply`/`sync` asks for an
+interactive confirmation; in a non-interactive process it fails closed. Immediately before confirmation, the
+preview prints only the exact `CODEX_HOME`, resolved model/effort/provider
+values, sandbox modes, and target filenames; it does not print raw config.
+
+Every apply or sync creates a file-scoped UTC backup. Rollback is explicit:
+
+```bash
 python scripts/configure.py rollback --backup ~/.codex/backups/configure-sol-luna-subagents/<UTC-timestamp>
 ```
 
-`apply --run-codex` creates a timestamped, file-scoped backup before writing and
-validates `codex features list` within the same transaction; if validation fails,
-it automatically rolls back. `rollback` restores only the files listed in that
-backup manifest and removes files that the installation created. `verify`
-performs the final static checks without starting a model task.
+Rollback restores the recorded scope and may overwrite later edits to those
+files. Review the backup path before using it.
 
-See [简体中文说明](README.zh-CN.md) for the Chinese version.
+## Registries and synchronization
+
+An installation creates portable `model-tiers.toml` and `agent-tiers.toml`
+with managed blocks. Existing registries are never overwritten blindly:
+unmanaged collisions, malformed TOML, missing markers, and ambiguous role
+files stop before any write. Unrelated tiers and roles are retained.
+
+The bundled tier files are editable. After changing a managed tier's model or
+effort, inspect the result and run:
+
+```bash
+python scripts/configure.py tiers list
+python scripts/configure.py tiers check
+python scripts/configure.py sync --yes
+python scripts/configure.py verify
+```
+
+`sync` reads the registries and materializes their model/effort values into
+the global config and managed agents; it does not rewrite the registries.
+Used tier providers must agree with the effective main provider. Existing
+provider definitions and credentials are never changed.
+
+## Profiles and compatibility
+
+The selectable legacy profile is retained:
+
+```bash
+python scripts/configure.py apply --profile sol-luna --yes
+```
+
+It keeps `gpt-5.6-sol`/max and the historical
+`sol_luna_code_mapper`/`sol_luna_implementation_worker` filenames. Those
+names are compatibility names, not the current architecture. If an existing
+installation has those managed files, the default Astra profile upgrades them
+in place and adds the routine checker rather than creating a second writer.
+If canonical and compatibility files collide, the installer stops and asks
+for an explicit cleanup decision.
+
+## Scope and opt-in customization
+
+The installer writes only the global Codex home: native config, the active
+global `AGENTS.md`/`AGENTS.override.md` block, portable tier registries, and
+managed personal agent files under `~/.codex/agents/*.toml`. Codex also
+supports project-local `.codex/agents/*.toml`; project-specific bindings or
+templates are an opt-in task for the user and are not auto-discovered or
+modified here.
+
+The personal and project agent locations and per-role model, effort, and
+sandbox fields follow the [official subagent configuration documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents).
+
+Training/remote-job cadence and TensorBoard guidance are intentionally not
+installed as global policy. Add such project instructions explicitly when a
+project needs them.
+
+This package makes no universal model-support or fixed-credit-savings claim;
+actual usage depends on task routing, calls, account limits, and pricing.

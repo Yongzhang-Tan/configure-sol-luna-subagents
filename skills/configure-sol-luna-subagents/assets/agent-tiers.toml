@@ -1,0 +1,36 @@
+# BEGIN MANAGED: configure-sol-luna-subagents:agent-tiers
+# profile: astra-luna
+# Tier bindings select model/effort; sandbox and authority stay in agent TOML files.
+
+[roles.main]
+tier = "T1"
+effort = "medium"
+
+[roles.default_subagent]
+tier = "T2"
+effort = "max"
+
+[roles."agents.default"]
+tier = "T2"
+effort = "max"
+
+[roles.code_mapper]
+tier = "T2"
+effort = "max"
+
+[roles.implementation_worker]
+tier = "T2"
+effort = "max"
+
+[roles.routine_state_checker]
+tier = "T3"
+effort = "max"
+
+[roles.sol_luna_code_mapper]
+tier = "T2"
+effort = "max"
+
+[roles.sol_luna_implementation_worker]
+tier = "T2"
+effort = "max"
+# END MANAGED: configure-sol-luna-subagents:agent-tiers
